@@ -244,6 +244,11 @@ func TestOnTrackCalledIfRemoveTrackCalledAfterAddTrack(t *testing.T) {
 		assert.NoError(t, server.Close())
 		<-serverNegChannelClosed
 	}()
+	_, err = client.AddTransceiverFromKind(RTPCodecTypeVideo, []RTPTransceiverInit{{RTPTransceiverDirectionSendrecv, []RTPEncodingParameters{}}}...)
+	assert.NoError(t, err)
+
+	_, err = server.AddTransceiverFromKind(RTPCodecTypeVideo, []RTPTransceiverInit{{RTPTransceiverDirectionSendrecv, []RTPEncodingParameters{}}}...)
+	assert.NoError(t, err)
 
 	// Add a renegotation channel. Set these channels up before signaling/answering.
 	clientNegChannelOpened, clientNegChannelClosed, err = ConfigureForRenegotiation(client)
