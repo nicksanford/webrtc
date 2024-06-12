@@ -77,6 +77,7 @@ func TestPeerConnectionSuite(t *testing.T) {
 
 		// Send data over the track until we observe the `OnTrack` callback is invoked within 10 seconds.
 		for start := time.Now(); time.Since(start) < 10*time.Second; {
+			log.Println("writing packet")
 			err = trackLocal.WriteSample(media.Sample{Data: []byte{0, 0, 0, 0, 0}, Timestamp: time.Now(), Duration: time.Millisecond})
 			assert.NoError(t, err)
 			if onTrack.Load() == true {
@@ -151,7 +152,7 @@ func TestPeerConnectionSuite(t *testing.T) {
 		select {
 		case <-onTrackCalledCtx.Done():
 		case <-timeoutCtx.Done():
-			assert.Fail(t, "timed out waiting for OnTrack to be called")
+			assert.FailNow(t, "timed out waiting for OnTrack to be called")
 		}
 	})
 	t.Run("OnTrackCalledIfNoRTPPacketsSent", func(t *testing.T) {
@@ -215,7 +216,7 @@ func TestPeerConnectionSuite(t *testing.T) {
 		select {
 		case <-onTrackCalledCtx.Done():
 		case <-timeoutCtx.Done():
-			assert.Fail(t, "timed out waiting for OnTrack to be called")
+			assert.FailNow(t, "timed out waiting for OnTrack to be called")
 		}
 	})
 	t.Run("OnTrackCalledIfRemoveTrackCalledAfterAddTrack", func(t *testing.T) {
@@ -281,11 +282,11 @@ func TestPeerConnectionSuite(t *testing.T) {
 		select {
 		case <-onTrackCalledCtx.Done():
 		case <-timeoutCtx.Done():
-			assert.Fail(t, "timed out waiting for OnTrack to be called")
+			assert.FailNow(t, "timed out waiting for OnTrack to be called")
 		}
 	})
 
-	t.Run("ReadRTPReturnsErrorIfAddTrackSendPacketsStopSendingPacketsRemoveTrack", func(t *testing.T) {
+	t.Run("ReadRTPReturnsErrorIfServerPeerConnectionCloseCalledImmediatelyAfterRemoveTrack", func(t *testing.T) {
 		var (
 			clientNegChannelOpened <-chan struct{}
 			clientNegChannelClosed <-chan struct{}
@@ -327,11 +328,15 @@ func TestPeerConnectionSuite(t *testing.T) {
 		onTrackCalledCtx, onTrackCalled := context.WithCancel(context.Background())
 		client.OnTrack(func(tr *TrackRemote, _ *RTPReceiver) {
 			onTrackCalled()
-			monitorTrackRemoteTillEOF(t, tr, trackRemoteReturnedError)
+			monitorTrackRemoteTillEOF(tr, trackRemoteReturnedError)
 		})
 
 		trackLocal, err := NewTrackLocalStaticSample(RTPCodecCapability{MimeType: "video/H264"}, "video", "main+camera")
 		assert.NoError(t, err)
+
+		stopWritingCtx, stopWritingFn := context.WithCancel(context.Background())
+		// start writing packets
+		writeTill(stopWritingCtx, trackLocal)
 
 		// `AddTrack` triggers the `PeerConnection.OnNegotiationNeeded` callback. Which will
 		// asynchronously start our custom renegotiation code that sends offer/answer messages over the
@@ -339,59 +344,151 @@ func TestPeerConnectionSuite(t *testing.T) {
 		sender, err := server.AddTrack(trackLocal)
 		assert.NoError(t, err)
 
-		// start writing packets
 		// We expect the `OnTrack` callback is invoked within 10 seconds.
 		timeoutCtx, timeoutFn := context.WithTimeout(context.Background(), time.Second*10)
-
-		for start := time.Now(); time.Since(start) < 10*time.Second; {
-			err = trackLocal.WriteSample(media.Sample{Data: []byte{0, 0, 0, 0, 0}, Timestamp: time.Now(), Duration: time.Millisecond})
-			assert.NoError(t, err)
-			if onTrackCalledCtx.Err() != nil {
-				break
-			}
-			time.Sleep(time.Millisecond)
-		}
 
 		select {
 		case <-onTrackCalledCtx.Done():
 		case <-timeoutCtx.Done():
-			assert.Fail(t, "timed out waiting for OnTrack to be called")
+			assert.FailNow(t, "timed out waiting for OnTrack to be called")
 		}
 		timeoutFn()
 
-		// TODO sleep
-		time.Sleep(time.Second)
+		// stop writing
+		stopWritingFn()
 
 		// we remove the track
-		err = server.RemoveTrack(sender)
-		assert.NoError(t, err)
+		assert.NoError(t, server.RemoveTrack(sender))
+		// we close the server's peer connection
+		assert.NoError(t, server.Close())
 
 		// we expect the track remote to return an error within 10 seconds
+		log.Println("waiting for client's TrackRemote.ReadRTP() method to return a non timeout error")
 		timeoutCtx, timeoutFn = context.WithTimeout(context.Background(), time.Second*10)
 		select {
 		case <-trackRemoteReturnedError:
 		case <-timeoutCtx.Done():
-			assert.Fail(t, "timed out waiting for ReadRTP to return a non timeout error")
+			assert.FailNow(t, "timed out waiting for ReadRTP to return a non timeout error")
+		}
+		timeoutFn()
+	})
+
+	t.Run("ReadRTPReturnsErrorIfServerPeerConnectionCloseCalled", func(t *testing.T) {
+		var (
+			clientNegChannelOpened <-chan struct{}
+			clientNegChannelClosed <-chan struct{}
+			serverNegChannelOpened <-chan struct{}
+			serverNegChannelClosed <-chan struct{}
+		)
+
+		client, server, err := newPair()
+		assert.NoError(t, err)
+		defer func() {
+			assert.NoError(t, client.Close())
+			<-clientNegChannelClosed
+		}()
+
+		defer func() {
+			assert.NoError(t, server.Close())
+			<-serverNegChannelClosed
+		}()
+
+		// Add a renegotation channel. Set these channels up before signaling/answering.
+		clientNegChannelOpened, clientNegChannelClosed, err = ConfigureForRenegotiation(client)
+		assert.NoError(t, err)
+
+		serverNegChannelOpened, serverNegChannelClosed, err = ConfigureForRenegotiation(server)
+		assert.NoError(t, err)
+
+		// Run signaling/answering such that the client + server can connect to each other.
+		signalPair2(t, client, server)
+
+		// Wait for the negotiation channels (aka data channels) to be ready.
+		<-clientNegChannelOpened
+		<-serverNegChannelOpened
+
+		// This test observes a successful renegotiation by having a server create a video track, and
+		// communicating this to the client via the `negotiation` DataChannel. And then sending data
+		// over the video track. Install the `OnTrack` callback before kicking off the renegotiation via
+		// the (server) `AddTrack` call.
+		trackRemoteReturnedError := make(chan struct{})
+		onTrackCalledCtx, onTrackCalled := context.WithCancel(context.Background())
+		client.OnTrack(func(tr *TrackRemote, _ *RTPReceiver) {
+			onTrackCalled()
+			monitorTrackRemoteTillEOF(tr, trackRemoteReturnedError)
+		})
+
+		trackLocal, err := NewTrackLocalStaticSample(RTPCodecCapability{MimeType: "video/H264"}, "video", "main+camera")
+		assert.NoError(t, err)
+
+		stopWritingCtx, stopWritingFn := context.WithCancel(context.Background())
+		// stop writing at end of test
+		defer stopWritingFn()
+		// start writing packets
+		writeTill(stopWritingCtx, trackLocal)
+
+		// `AddTrack` triggers the `PeerConnection.OnNegotiationNeeded` callback. Which will
+		// asynchronously start our custom renegotiation code that sends offer/answer messages over the
+		// `negotiation` DataChannel.
+		_, err = server.AddTrack(trackLocal)
+		assert.NoError(t, err)
+
+		// We expect the `OnTrack` callback is invoked within 10 seconds.
+		timeoutCtx, timeoutFn := context.WithTimeout(context.Background(), time.Second*10)
+
+		select {
+		case <-onTrackCalledCtx.Done():
+		case <-timeoutCtx.Done():
+			assert.FailNow(t, "timed out waiting for OnTrack to be called")
+		}
+		timeoutFn()
+
+		// we close the server's peer connection
+		assert.NoError(t, server.Close())
+
+		// we expect the track remote to return an error within 10 seconds
+		log.Println("waiting for client's TrackRemote.ReadRTP() method to return a non timeout error")
+		timeoutCtx, timeoutFn = context.WithTimeout(context.Background(), time.Second*10)
+		select {
+		case <-trackRemoteReturnedError:
+		case <-timeoutCtx.Done():
+			assert.FailNow(t, "timed out waiting for ReadRTP to return a non timeout error")
 		}
 		timeoutFn()
 	})
 }
 
-func monitorTrackRemoteTillEOF(t *testing.T, tr *TrackRemote, trackRemoteReturnedError chan struct{}) {
-	readRTPTimeout := time.Millisecond * 200
+func writeTill(ctx context.Context, trackLocal *TrackLocalStaticSample) {
+	go func() {
+		for start := time.Now(); time.Since(start) < 10*time.Second; {
+			if ctx.Err() != nil {
+				return
+			}
+			log.Println("writing packet")
+			err := trackLocal.WriteSample(media.Sample{Data: []byte{0, 0, 0, 0, 0}, Timestamp: time.Now(), Duration: time.Millisecond})
+			if err != nil {
+				log.Println(err.Error())
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}()
+}
+
+func monitorTrackRemoteTillEOF(tr *TrackRemote, trackRemoteReturnedError chan struct{}) {
 	for {
-		deadline := time.Now().Add(readRTPTimeout)
-		assert.NoError(t, tr.SetReadDeadline(deadline))
+		log.Printf("ReadRTP called")
 		if _, _, err := tr.ReadRTP(); err != nil {
 			if os.IsTimeout(err) {
 				log.Printf("ReadRTP got timeout error: %s", err.Error())
 				continue
 			}
 			if trackRemoteReturnedError != nil {
+				log.Println("closing trackRemoteReturnedError", err.Error())
 				close(trackRemoteReturnedError)
 			}
 			trackRemoteReturnedError = nil
 		}
+		log.Println("got packet")
 	}
 }
 
