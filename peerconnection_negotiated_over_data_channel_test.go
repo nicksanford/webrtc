@@ -19,7 +19,7 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-// This shows that OnTrack is not guaranteed to be called if AddTrack is called imediately after the peer connection is established
+// This shows that OnTrack is not guaranteed to be called if AddTrack is called immediately after the peer connection is established
 // run `go test -v -race -run TestOnTrackCalledAfterPeerConnectionEstablished -count 100 --failfast` to repro
 func TestPeerConnectionSuite(t *testing.T) {
 	t.Run("OnTrackCalledAfterPeerConnectionEstablished", func(t *testing.T) {
